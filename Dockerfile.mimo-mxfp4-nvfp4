@@ -1,0 +1,42 @@
+# Builds `mimo-mxfp4-nvfp4:local` — the vendor MiMo MXFP4 image + 2 patches that
+# unlock nvfp4 KV cache. Rebuild with:
+#   sudo docker build -f /home/user/models/Dockerfile.mimo-mxfp4-nvfp4 -t mimo-mxfp4-nvfp4:local /home/user/models
+#
+# WHY THESE PATCHES
+# The Triton DiffKV kernel already handles nvfp4 — triton_attn_diffkv.py is
+# byte-identical (261 lines) to the one in /home/user/vllm-venv, which serves
+# nvfp4 for the 0703 daily driver every day. The image just never *declared* it,
+# and unlike the native venv (whose mimo_v2.py constructs the backend class
+# directly, bypassing validation) this image routes through the attention
+# selector, which enforces `supported_kv_cache_dtypes`.
+FROM cstechdev/vllm:eldritch-enlightenment-mimo25-dflash-mxfp4-v2-cu132-20260705
+
+# (1) Declare nvfp4 on the DiffKV backend so the selector stops rejecting it.
+RUN F=/opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/triton_attn_diffkv.py && \
+    sed -i '78a\        "nvfp4",' $F && \
+    sed -n '77,83p' $F
+
+# (2) Don't pad V to head_dim when a DiffKV backend is active. Otherwise the
+#     allocator builds a 384-wide cache (192 K + 192 PADDED V) while the DiffKV
+#     kernel reads 320 (192 K + 128 PACKED V), giving:
+#       RuntimeError: shape '[7738,64,2,320]' is invalid for input of size 380338176
+#     (380338176 / (7738*64*2) == 384)
+RUN G=/opt/venv/lib/python3.12/site-packages/vllm/model_executor/models/mimo_v2.py && \
+    sed -i '344a\            and configured_backend_name not in ("TRITON_ATTN_DIFFKV", "FLASH_ATTN_DIFFKV")' $G && \
+    sed -n '341,348p' $G
+
+# (3) Audio input deps for MiMoV2OmniForCausalLM. The checkpoint ships
+#     audio_encoder (75 tensors) + speech_embeddings (20), but the image lacks
+#     the decoders. PyAV is the load-bearing one (per the 0703 driver notes);
+#     vllm also imports librosa. soundfile for WAV.
+RUN /opt/venv/bin/pip install --no-cache-dir av soundfile librosa && \
+    /opt/venv/bin/python -c "import av, soundfile, librosa; print('audio deps OK', av.__version__, librosa.__version__)"
+
+# (4) torchaudio — REQUIRED by MiMoOmniProcessor.mel_spectrogram (mimo_v2_omni.py:406),
+#     which raises "torchaudio is required for audio" without it. The stock PyPI wheel is
+#     built for CUDA 13.0 and torch here is 2.12.0+cu132 -> _check_cuda_version() raises at
+#     import. The CPU build has version.cuda=None so the check is skipped, and the mel is
+#     pure torch.stft + filterbank (CPU-side in the processor), so CUDA is not needed.
+#     Verified: MelSpectrogram(16kHz) forward returns a valid (n_mels, frames) tensor.
+RUN /opt/venv/bin/pip install --no-cache-dir --no-deps torchaudio --index-url https://download.pytorch.org/whl/cpu && \
+    /opt/venv/bin/python -c "import torch, torchaudio; from torchaudio.transforms import MelSpectrogram; print('torchaudio OK', torchaudio.__version__, tuple(MelSpectrogram(sample_rate=16000)(torch.zeros(16000)).shape))"
