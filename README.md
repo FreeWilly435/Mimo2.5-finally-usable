@@ -16,8 +16,8 @@ while the model still scores **88/100** on a hard agentic tool‑calling benchma
 ## The model
 
 - **MiMo‑V2.5‑DFlash‑MXFP4A16** (Xiaomi MiMo‑V2.5), served as `MiMo-V2.5`. 310B total / ~15B active MoE.
-  Source weights: [`XiaomiMiMo/MiMo-V2.5-DFlash`](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-DFlash)
-  (this is the MXFP4A16 build of it).
+  Served weights: [`chriswritescode/MiMo-V2.5-DFlash-MXFP4A16`](https://huggingface.co/chriswritescode/MiMo-V2.5-DFlash-MXFP4A16)
+  — the MXFP4A16 build of [`XiaomiMiMo/MiMo-V2.5-DFlash`](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-DFlash).
 - Mixed precision (the `config.json` under‑describes it):
   - **MoE experts:** MXFP4 (U8‑packed 4‑bit + E8M0 block scales, block 32)
   - **`qkv_proj`:** block‑FP8 (`F8_E4M3`) · **`o_proj`:** BF16
@@ -104,6 +104,35 @@ attention backend rejects attention sinks) — so NVFP4 forces spec off, at no c
 > (`Tried to allocate 526 MiB, 291 MiB free`). 0.96 leaves ~2.7 GiB/card of prefill headroom and
 > serves long context **reliably**. True 1M context needs ~2.5 GiB more KV than exists on 2×96 GB.
 
+### This recipe vs. the upstream default
+
+The model card ships a reference recipe built for a **4‑GPU** box (image + full `docker run` at
+[`chriswritescode/MiMo-V2.5-DFlash-MXFP4A16`](https://huggingface.co/chriswritescode/MiMo-V2.5-DFlash-MXFP4A16)).
+If you have 4× 96 GB, just run that — it's simpler. This repo is what you change to run the **same
+model and ~the same 500K context on half the GPUs**:
+
+| knob | Upstream card (4‑GPU) | This recipe (2‑GPU) |
+|---|---|---|
+| Parallelism | **TP4** (`CUDA_VISIBLE_DEVICES=0,1,2,3`) | **TP2** |
+| **KV cache** | `auto` (bf16) | **`nvfp4`** — the change that makes 512K fit on 2 cards |
+| Attention backend | `TRITON_ATTN` | `TRITON_ATTN_DIFFKV` + the 2‑line declare/pad patch |
+| **DFlash speculation** | **on**, 7 tokens | **off** — worse on this box, and nvfp4‑incompatible |
+| GPU‑mem‑util | 0.90 | 0.96 |
+| max‑num‑seqs / batched‑tokens | 64 / 16384 (throughput) | 4 / 4096 (long‑ctx single‑stream) |
+| block‑size | 64 | 32 |
+| max‑model‑len | 500,000 | 524,288 (512K) |
+| image | `…mxfp4-v1-cu132-20260705` | `…mxfp4-v2-…` + patch → `mimo-mxfp4-nvfp4:local` |
+| audio | — | `OMNI=1` (MiMoV2Omni) |
+
+**Why the differences chain together:** on TP4 the weights are ~40 GB/card, leaving ample room for
+a bf16 KV cache *and* DFlash's scratch — so the upstream recipe keeps both and cranks concurrency
+(64 seqs). On **TP2** the weights are ~83 GB/card with only ~13 GB left; a bf16 KV cache can't hold
+long context there. Quantizing KV to **NVFP4** (~4.5 bits/value) reclaims it — but that path runs
+through the **DiffKV** backend (hence the 2‑line patch), and the only nvfp4‑capable attention
+backend rejects the attention sinks the DFlash draft head needs, so **speculation comes off**. Net
+trade: give up the upstream's raw throughput, gain long context + audio on **two** cards instead of
+four.
+
 ---
 
 ## Quality — hard agentic tool‑calling benchmark
@@ -135,8 +164,10 @@ MiMo's edge isn't the hard subset — it's the **broad** suite (88), plus 512K c
 > **greedy it's a clean 73**. A real, if modest, improvement over the old number — and the failures are
 > genuine quality misses, not timeouts.
 
-**Source models:** MiMo‑V2.5 → [`XiaomiMiMo/MiMo-V2.5-DFlash`](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-DFlash)
-(served as the MXFP4A16 build) · Hunyuan‑3 → [`tencent/Hy3`](https://huggingface.co/tencent/Hy3),
+**Source models:** MiMo‑V2.5 → served weights
+[`chriswritescode/MiMo-V2.5-DFlash-MXFP4A16`](https://huggingface.co/chriswritescode/MiMo-V2.5-DFlash-MXFP4A16)
+(the MXFP4A16 build of [`XiaomiMiMo/MiMo-V2.5-DFlash`](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-DFlash)) ·
+Hunyuan‑3 → [`tencent/Hy3`](https://huggingface.co/tencent/Hy3),
 NVFP4 quant [`kodelow/Hy3-NVFP4-W4A16`](https://huggingface.co/kodelow/Hy3-NVFP4-W4A16) ·
 DeepSeek‑V4‑Flash → [`deepseek-ai/DeepSeek-V4-Flash`](https://huggingface.co/deepseek-ai) (DSpark variant).
 
