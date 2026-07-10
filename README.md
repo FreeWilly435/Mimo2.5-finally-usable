@@ -86,10 +86,18 @@ enforces `supported_kv_cache_dtypes`. So the fix is a **2‑line patch** baked i
    DiffKV kernel reads **320** (192 K + 128 *packed* V) →
    `RuntimeError: shape '[…,320]' is invalid for input of size … (== 384‑wide)`.
 
-**Speculation is deliberately OFF.** MiMo ships a 7‑token **DFlash** drafter, but here it measured
-*worse* (−28 % single‑stream, and it reserves KV that shrinks the pool ~56 %). It's also
-incompatible with NVFP4 (the draft head routes through the selector, and the only NVFP4‑capable
-attention backend rejects attention sinks) — so NVFP4 forces spec off, at no cost.
+**Speculation is deliberately OFF — turning it on would *cost* context here, not add speed.**
+MiMo ships a 7‑token **DFlash** drafter, but on this box it's a lose‑lose:
+- **Less context.** The draft‑token KV reservation shrinks the pool ~**36 %** (measured 299,361 → 191,575
+  at bf16‑KV/64K) — on the nvfp4 512K config that's roughly a 512K → ~330–380K haircut.
+- **Slower single‑stream.** −28 % (130.6 → 101.8 tok/s). On RTX PRO 6000 decode is already ~128 tok/s,
+  so draft‑then‑verify doesn't pay for itself.
+- **Not a flag‑flip on the stock image.** DFlash + nvfp4‑KV are *path*‑incompatible here: the draft head
+  routes through the attention selector → flashinfer → which rejects the attention sinks it needs. That's
+  **not fundamental** — [danielgbates / DoctorMasterNewb](#related-work--credits) makes the two coexist by
+  decoupling the drafter as a `custom_class` proposer (bypassing the selector). But even with that, on
+  high‑compute cards the overhead still doesn't pay. It earns its keep on **weaker** hardware (his 2× DGX
+  Spark), not here.
 
 ## The serve config
 
@@ -293,6 +301,22 @@ Files: [`serve_mimo_mxfp4_nvfp4.sh`](./serve_mimo_mxfp4_nvfp4.sh) ·
   (`RuntimeError: cancelled`).
 - **Docker build context**: build from an *empty* dir; the model tree is ~1.6 TB and will fill the
   disk if used as context.
+
+## Related work & credits
+
+- **NVFP4 KV cache for MiMo‑DFlash / DiffKV** — the idea (and the trick for running DFlash speculation
+  *alongside* an nvfp4 KV cache, by decoupling the drafter as a `custom_class` proposer) comes from
+  **danielgbates / DoctorMasterNewb**:
+  [forum writeup](https://forums.developer.nvidia.com/t/mimo-v2-5-dflash-and-a-4-bit-nvfp4-kv-cache-in-one-vllm-instance-on-the-v0-24-0-release-2x-dgx-spark/375923)
+  · [`DoctorMasterNewb/vLLM-MiMo-V2.5-DFlash-NVFP4Kv`](https://github.com/DoctorMasterNewb/vLLM-MiMo-V2.5-DFlash-NVFP4Kv).
+  He runs it on **2× DGX Spark (GB10)** with **DFlash on** and a **~1.35M‑token** KV pool (vLLM 0.24.0 + his mods);
+  this repo runs the same nvfp4‑KV idea on **2× RTX PRO 6000** with **spec off** — a complementary point on
+  the curve (weak/large‑memory + spec vs. high‑compute + long context). His fp8‑vs‑4‑bit note is worth
+  heeding too: fp8 KV decodes deep context *faster* (fp8 attention is cheaper than 4‑bit) — nvfp4 trades
+  some decode speed for pool size.
+- **Model:** [`chriswritescode/MiMo-V2.5-DFlash-MXFP4A16`](https://huggingface.co/chriswritescode/MiMo-V2.5-DFlash-MXFP4A16)
+  (MXFP4A16 build) · base [`XiaomiMiMo/MiMo-V2.5-DFlash`](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-DFlash)
+  · image `cstechdev/vllm:eldritch-…mimo25-dflash-mxfp4-v2-cu132-20260705`.
 
 *Measured 2026‑07‑10 on the box above (vLLM v0.11.2.dev279, base image
 `cstechdev/vllm:eldritch-enlightenment-mimo25-dflash-mxfp4-v2-cu132-20260705`).*
